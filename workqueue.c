@@ -11,6 +11,33 @@ enum DELAYED_WORK_STATUS {
 	DW_RUN_NOW,
 };
 
+/*
+ * System-wide workqueues which are always present.
+ *
+ * system_wq is the one used by schedule[_delayed]_work[_on]().
+ * Multi-CPU multi-threaded.  There are users which expect relatively
+ * short queue flush time.  Don't queue works which can run for too
+ * long.
+ *
+ * system_long_wq is similar to system_wq but may host long running
+ * works.  Queue flushing might take relatively long.
+ *
+ * system_nrt_wq is non-reentrant and guarantees that any given work
+ * item is never executed in parallel by multiple CPUs.  Queue
+ * flushing might take relatively long.
+ *
+ * system_unbound_wq is unbound workqueue.  Workers are not bound to
+ * any specific CPU, not concurrency managed, and all queued works are
+ * executed immediately as long as max_active limit is not reached and
+ * resources are available.
+ *
+ * system_freezable_wq is equivalent to system_wq except that it's
+ * freezable.
+ *
+ * system_nrt_freezable_wq is equivalent to system_nrt_wq except that
+ * it's freezable.
+ */
+
 struct workqueue_struct *system_wq = NULL;
 //struct workqueue_struct *system_long_wq = NULL;
 //struct workqueue_struct *system_nrt_wq = NULL;
@@ -33,15 +60,14 @@ void destroy_wq_system (void) {
 		destroy_workqueue(system_wq);
 }
 
-workqueue_struct_t *
-init_workqueue (const char *name, int threads)
+workqueue_struct_t *init_workqueue (const char *name, int threads)
 {
 	int status;
 	pthread_condattr_t cond_attr;
 	workqueue_struct_t *wq = NULL;
 
 	wq = (workqueue_struct_t *)kzalloc ( sizeof (workqueue_struct_t),
-			GFP_KERNEL);
+										 GFP_KERNEL);
 	if (wq == NULL){
 		qnx_error("kzalloc failed.");
 		return NULL;
@@ -49,8 +75,15 @@ init_workqueue (const char *name, int threads)
 	status = pthread_attr_init (&wq->attr);
 	if (status != 0)
 		goto free_wq;
-	status = pthread_attr_setdetachstate (&wq->attr,
-			PTHREAD_CREATE_DETACHED);
+	status = pthread_attr_setdetachstate (&wq->attr, PTHREAD_CREATE_DETACHED);
+	if (status != 0) {
+		goto free_attr;
+	}
+	status = pthread_attr_setstacksize(&wq->attr, THREAD_STACK_SIZE);
+	if (status != 0) {
+		goto free_attr;
+	}
+	status = pthread_attr_setguardsize(&wq->attr, THREAD_STACK_GUARD_SIZE);
 	if (status != 0) {
 		goto free_attr;
 	}
@@ -80,8 +113,10 @@ init_workqueue (const char *name, int threads)
 	wq->last = NULL;
 	strcpy(wq->name, name);
 	wq->valid = WORKQ_VALID;
+	INIT_LIST_HEAD (&wq->flush_list);
+
 	if ( 0 != pthread_create (&wq->id, &wq->attr, workqueue_thread,
-			(void*)wq)) {
+							  (void*)wq)) {
 		goto free_delayed_cv;
 	}
 	pthread_condattr_destroy(&cond_attr);
@@ -101,8 +136,7 @@ init_workqueue (const char *name, int threads)
 	return NULL;
 }
 
-void
-destroy_workqueue (workqueue_struct_t *wq)
+void destroy_workqueue (workqueue_struct_t *wq)
 {
 	assert (wq->valid == WORKQ_VALID);
 	/* notify thread to quit */
@@ -128,7 +162,7 @@ destroy_workqueue (workqueue_struct_t *wq)
 
 static int
 push_work (workqueue_struct_t *wq,
-		   work_struct_t *item)
+			 work_struct_t *item)
 {
 	assert(wq->valid == WORKQ_VALID);
 	assert(item->func);
@@ -208,9 +242,8 @@ remove_work(workqueue_struct_t *wq, work_struct_t * wk)
 	return 0;
 }
 
-void
-queue_work (workqueue_struct_t *wq,
-			work_struct_t * w)
+void queue_work (workqueue_struct_t *wq,
+				 work_struct_t * w)
 {
 	pthread_mutex_lock (&wq->mutex);
 	assert(w->func);
@@ -240,8 +273,7 @@ queue_work (workqueue_struct_t *wq,
  * Return:
  * %true if @work was pending, %false otherwise.
  */
-bool
-cancel_work_sync(struct work_struct *work)
+bool cancel_work_sync(struct work_struct *work)
 {
 	int rc;
 	workqueue_struct_t * wq = work->wq;
@@ -278,8 +310,7 @@ flusher_func(struct work_struct *work)
 	pthread_mutex_unlock (&wq->mutex);
 }
 
-void
-flush_workqueue (workqueue_struct_t *wq)
+void flush_workqueue (workqueue_struct_t *wq)
 {
 	 struct flush_data data = {
 		 .wq = wq,
@@ -361,17 +392,15 @@ delayed_func(struct work_struct *work)
 }
 
 /*TODO. FIXME. we should sort delayed works in workqueue */
-bool
-queue_delayed_work(workqueue_struct_t *wq,
+static bool
+queue_delayed_work_locked(workqueue_struct_t *wq,
 						struct delayed_work *dw,
 						unsigned long delay)
 {
-	pthread_mutex_lock (&wq->mutex);
 	if(dw->status == DW_NOT_IN_QUEUE){
 		dw->status = DW_IN_QUEUE;
 	} else {
 		/* already in queue */
-		pthread_mutex_unlock (&wq->mutex);
 		return true;
 	}
 	assert(dw->data == dw);
@@ -382,15 +411,23 @@ queue_delayed_work(workqueue_struct_t *wq,
 	dw->work.func = delayed_func;
 	push_work(wq, &dw->work);
 
-	pthread_mutex_unlock (&wq->mutex);
 	return true;
 }
 
 bool
-mod_delayed_work_on(int cpu,
-		struct workqueue_struct *wq,
-		struct delayed_work *dw,
-		unsigned long delay)
+queue_delayed_work(workqueue_struct_t *wq,
+						struct delayed_work *dw,
+						unsigned long delay)
+{
+	bool rc;
+	pthread_mutex_lock (&wq->mutex);
+	rc = queue_delayed_work_locked(wq, dw, delay);
+	pthread_mutex_unlock (&wq->mutex);
+	return rc;
+}
+bool mod_delayed_work_on(int cpu, struct workqueue_struct *wq,
+						 struct delayed_work *dw,
+						 unsigned long delay)
 {
 	bool rc = true;
 	(void)cpu;
@@ -399,8 +436,7 @@ mod_delayed_work_on(int cpu,
 	if(!wq->flush){
 		switch(dw->status){
 		case DW_NOT_IN_QUEUE: /* it's not in queue. add it */
-			pthread_mutex_unlock(&wq->mutex);
-			queue_delayed_work(wq, dw, delay);
+			rc = queue_delayed_work_locked(wq, dw, delay);
 			break;
 		case DW_IN_QUEUE:   /* in queue, but not runing yet */
 		case DW_WAITING_TIMEOUT: {
@@ -488,8 +524,7 @@ cancel_dwork(struct delayed_work *dw, bool sync)
  *
  * This function is safe to call from any context including IRQ handler.
  */
-bool
-cancel_delayed_work(struct delayed_work *dw)
+bool cancel_delayed_work(struct delayed_work *dw)
 {
 	return cancel_dwork(dw, false);
 }
@@ -502,8 +537,7 @@ cancel_delayed_work(struct delayed_work *dw)
  * Return:
  * %true if @dwork was pending, %false otherwise.
  */
-bool
-cancel_delayed_work_sync(struct delayed_work *dw)
+bool cancel_delayed_work_sync(struct delayed_work *dw)
 {
 	return cancel_dwork(dw, true);
 }
@@ -520,13 +554,26 @@ cancel_delayed_work_sync(struct delayed_work *dw)
  * %true if flush_work() waited for the work to finish execution,
  * %false if it was already idle.
  */
-bool
-flush_work(struct work_struct *work)
+bool flush_work(struct work_struct *work)
 {
 	struct workqueue_struct * wq = work->wq;
 	pthread_mutex_lock(&wq->mutex);
-	while(work->status !=1){
-		pthread_cond_wait(&wq->cv, &wq->mutex);
+	if(work->status != 1) {
+		bool f = false;
+		struct work_struct * w;
+		list_for_each_entry(w, &wq->flush_list, list){
+			if (work == w){
+				f = true;
+				break;
+			}
+		}
+		if(!f){
+			list_add(&wq->flush_list, &work->list);
+		}
+		while(work->status !=1){
+			pthread_cond_wait(&wq->cv, &wq->mutex);
+		}
+		list_del(&work->list);
 	}
 	pthread_mutex_lock(&wq->mutex);
 	return true;
@@ -543,8 +590,7 @@ flush_work(struct work_struct *work)
  * %true if flush_work() waited for the work to finish execution,
  * %false if it was already idle.
  */
-bool
-flush_delayed_work(struct delayed_work *dw)
+bool flush_delayed_work(struct delayed_work *dw)
 {
 	bool rc = true, sync = true;
 	workqueue_struct_t *wq = dw->work.wq;
@@ -598,8 +644,7 @@ flush_delayed_work(struct delayed_work *dw)
 }
 
 
-static void *
-workqueue_thread (void *arg)
+static void *workqueue_thread (void *arg)
 {
 	struct timespec timeout;
 	workqueue_struct_t *wq = (workqueue_struct_t *)arg;
@@ -618,8 +663,7 @@ workqueue_thread (void *arg)
 		timeout.tv_sec += WORKQUEUE_WORKER_EXIT_TIMEOUT;
 
 		while ((we = pop_work(wq)) == NULL && !wq->quit) {
-			status = pthread_cond_timedwait (&wq->cv, &wq->mutex,
-											 &timeout);
+			status = pthread_cond_timedwait (&wq->cv, &wq->mutex, &timeout);
 			if (status == ETIMEDOUT) {
 				break;
 			} else if (status != 0) {
@@ -634,10 +678,22 @@ workqueue_thread (void *arg)
 		if (we) {
 			status = pthread_mutex_unlock (&wq->mutex);
 			assert(EOK == status);
+			/* NOTE: if func free 'we', then 'we' should not be on
+			   flush_list which means there are no threads waiting on it,
+			   else it is a BUG! */
 			we->func (we->data);
+			/* we is not valid, since it was freed in func() */
 			status = pthread_mutex_lock (&wq->mutex);
 			assert(EOK == status);
-			we->status = 1;
+
+			struct work_struct * w;
+			list_for_each_entry(w, &wq->flush_list, list){
+				if (we == w){
+					we->status = 1;
+					pthread_cond_broadcast(&wq->cv);
+					break;
+				}
+			}
 			pthread_cond_broadcast(&wq->cv);
 		}
 	}
@@ -656,8 +712,12 @@ workqueue_thread (void *arg)
  * Return:
  * OR'd bitmask of WORK_BUSY_* bits.
  */
-unsigned int
-work_busy(struct work_struct *work)
+unsigned int work_busy(struct work_struct *work)
 {
 	return 0;
 }
+
+#if defined(__QNXNTO__) && defined(__USESRCVERSION)
+#include <sys/srcversion.h>
+__SRCVERSION("$URL: http://svn.ott.qnx.com/product/branches/6.6.0/trunk/hardware/gpu/drm/server-3.12.2/qnx/workqueue.c $ $Rev: 779374 $")
+#endif
